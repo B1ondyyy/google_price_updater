@@ -1,16 +1,15 @@
 import subprocess
 import threading
-
+import time
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import requests
 from pydantic import BaseModel
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import time
-import threading
 
 # Функция для запуска Uvicorn сервера
 def run_uvicorn():
@@ -19,9 +18,8 @@ def run_uvicorn():
 
 # Запуск сервера FastAPI в фоновом режиме
 if __name__ == "__main__":
-    # Запуск сервера в отдельном потоке
     server_thread = threading.Thread(target=run_uvicorn)
-    server_thread.daemon = True  # Это позволяет завершить поток при завершении главной программы
+    server_thread.daemon = True
     server_thread.start()
 
 app = FastAPI()
@@ -35,99 +33,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# URL для получения данных о заявках на продажу на рынке USDT/RUB
-url = "https://garantex.org/api/v2/depth?market=usdtrub"
+# URL для парсинга цены USDT/RUB
+url = "https://cryptotyumen.ru/"
 
-# Модель для возвращаемых данных
+# Модель для API-ответа
 class PriceResponse(BaseModel):
     timestamp: str
     price_usdt_rub: float
-    price_with_commission_usdt_rub: float
 
 # Google Sheets setup
-SERVICE_ACCOUNT_FILE = 'tmp/testtable-451412-bd646fcb945f.json'
+SERVICE_ACCOUNT_FILE = 'tmp/asic-price-cc8ecc41768a.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SPREADSHEET_ID = '1NOIBvsLTnh_p550GYqel2Twc8s3B-5mvWi5-NMbkMhk'  # Ваш ID таблицы
-SHEET_NAME = 'Москва'  # Имя листа
+SPREADSHEET_ID = '1IVc5OpcfjA4-k9h9c7_0MJWhsPhU-IdAM1iZPi8iTJM'  # ID таблицы
+SHEET_NAME = 'New'  # Имя листа
 
-# Функция для подключения к Google Sheets API
+# Функция подключения к Google Sheets API
 def get_google_sheets_service():
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     service = build('sheets', 'v4', credentials=creds)
     return service.spreadsheets()
 
 # Функция для записи данных в Google Sheets
-def write_to_google_sheets(price_with_commission):
+def write_to_google_sheets(price):
     try:
         service = get_google_sheets_service()
 
-        # # Округляем цену до одной цифры после запятой
-        rounded_price = round(price_with_commission, 1)
+        # Округляем цену до двух знаков после запятой
+        rounded_price = round(price, 2)
 
-        # Подготовка данных для записи
         values = [[rounded_price]]
-        body = {
-            'values': values
-        }
+        body = {'values': values}
 
-        # Запись данных в ячейку B2
+        # Запись в ячейку I2
         result = service.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!F2",  # Указываем ячейку, например, F2
+            range=f"{SHEET_NAME}!I2",
             valueInputOption="RAW",
             body=body
         ).execute()
 
-        print(f"Data successfully written to sheet: {result}")
+        print(f"Цена успешно обновлена: {result}")
 
     except HttpError as err:
-        print(f"Error occurred: {err}")
+        print(f"Ошибка Google Sheets: {err}")
+
+# Функция парсинга цены с CryptoTyumen
+def get_usdt_price():
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Находим элемент с ценой
+            price_input = soup.find("input", {"name": "sum1"})
+            if price_input and price_input.has_attr("value"):
+                return float(price_input["value"])
+            else:
+                print("Ошибка: не удалось найти цену на сайте.")
+                return None
+        else:
+            print(f"Ошибка запроса: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Ошибка парсинга: {e}")
+        return None
 
 # Функция для автоматического обновления цены
 def auto_update_price():
     while True:
-        # Отправляем запрос на получение цены
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('asks'):
-                price = float(data['asks'][0]['price'])  # Получаем цену продажи USDT в рублях
-                commission = 0.007  # Комиссия на сайте (0.7%)
-                price_with_commission = price * (1 + commission)
-
-                # Записываем данные в Google Sheets
-                write_to_google_sheets(round(price_with_commission, 2))
-
-        # Ждем 10 секунд перед следующим обновлением
-        time.sleep(10)
+        price = get_usdt_price()
+        if price:
+            write_to_google_sheets(price)
+        time.sleep(600)
 
 # Запуск обновления данных в фоновом режиме
 update_thread = threading.Thread(target=auto_update_price)
-update_thread.daemon = True  # Это позволяет завершить поток при завершении главной программы
+update_thread.daemon = True
 update_thread.start()
 
-# Эндпоинт для получения данных о цене
+# Эндпоинт API для получения текущей цены
 @app.get("/price", response_model=PriceResponse)
 async def get_price():
-    # Отправка GET-запроса к API Garantex
-    response = requests.get(url)
-
-    # Проверка успешности запроса
-    if response.status_code == 200:
-        data = response.json()
-        if data.get('asks'):
-            price = float(data['asks'][0]['price'])  # Получаем цену продажи USDT в рублях
-            commission = 0.007  # Комиссия на сайте (0.7%)
-            price_with_commission = price * (1 + commission)
-
-            # Формируем результат для ответа
-            result = PriceResponse(
-                timestamp=datetime.now().isoformat(),
-                price_usdt_rub=price,
-                price_with_commission_usdt_rub=round(price_with_commission, 2)
-            )
-            return result
-        else:
-            return {"error": "Нет доступных заявок на продажу."}
+    price = get_usdt_price()
+    if price:
+        return PriceResponse(timestamp=datetime.now().isoformat(), price_usdt_rub=price)
     else:
-        return {"error": f"Ошибка при получении данных: {response.status_code}"}
+        return {"error": "Не удалось получить цену."}
